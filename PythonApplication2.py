@@ -1,146 +1,102 @@
-import os
-import zipfile
-import shutil
 import numpy as np
-import matplotlib.pyplot as plt
+import cv2
+import os
+from hmmlearn import hmm
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report, confusion_matrix
-from tensorflow.keras.preprocessing.image import ImageDataGenerator
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Conv2D, MaxPooling2D, Flatten, Dense, Dropout, BatchNormalization
-from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.callbacks import ModelCheckpoint
+from tqdm import tqdm  # NEW: tqdm for progress bar!
 
-# === STEP 1: UNZIP DATA ===
-zip_path = os.path.expanduser('~/Downloads/plantvillage.zip')
-extract_path = 'plantvillage_data'
+# 1. Feature extraction
+def extract_features(image_path):
+    img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        return None
+    img = cv2.resize(img, (128, 32))  # Resize to standard size
+    img = img / 255.0  # Normalize pixel values
+    return img.flatten()
 
-with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-    zip_ref.extractall(extract_path)
+# 2. Load dataset
+def load_dataset(images_folder):
+    X, y = [], []
 
-base_dir = os.path.join(extract_path, 'plantvillage')
-train_dir = 'plantvillage_split/train'
-test_dir = 'plantvillage_split/test'
+    folder_names = [f for f in os.listdir(images_folder) if os.path.isdir(os.path.join(images_folder, f))]
+    folder_names = sorted(folder_names, key=lambda x: int(x))  # Sort folder names numerically
 
-os.makedirs(train_dir, exist_ok=True)
-os.makedirs(test_dir, exist_ok=True)
+    for folder_name in tqdm(folder_names, desc="Loading folders"):
+        folder_path = os.path.join(images_folder, folder_name)
 
-# === STEP 2: SPLIT INTO TRAIN/TEST ===
-class_folders = [f for f in os.listdir(base_dir) if os.path.isdir(os.path.join(base_dir, f))]
+        folder_num = int(folder_name)
 
-for class_name in class_folders:
-    class_path = os.path.join(base_dir, class_name)
-    images = [img for img in os.listdir(class_path) if img.lower().endswith(('.jpg', '.jpeg', '.png'))]
-    
-    if len(images) == 0:
-        print(f"[WARNING] No images found in class folder: {class_name}. Skipping...")
-        continue
+        # Numbers (0-9)
+        if folder_num <= 9:
+            label = str(folder_num)
+        else:
+            # Letters (folder 10 and above)
+            char_index = (folder_num - 10) // 2
+            is_upper = (folder_num - 10) % 2
+            letter = chr(ord('a') + char_index)
+            label = letter.upper() if is_upper else letter.lower()
 
-    img_paths = [os.path.join(class_path, img) for img in images]
-    
-    train_imgs, test_imgs = train_test_split(img_paths, train_size=0.8, random_state=42)
+        image_files = [f for f in os.listdir(folder_path) if f.endswith('.png')]
 
-    os.makedirs(os.path.join(train_dir, class_name), exist_ok=True)
-    os.makedirs(os.path.join(test_dir, class_name), exist_ok=True)
+        for filename in tqdm(image_files, desc=f"Loading images from folder {folder_name}", leave=False):
+            img_path = os.path.join(folder_path, filename)
 
-    for img in train_imgs:
-        shutil.copy(img, os.path.join(train_dir, class_name))
-    for img in test_imgs:
-        shutil.copy(img, os.path.join(test_dir, class_name))
+            features = extract_features(img_path)
+            if features is not None:
+                X.append(features)
+                y.append(label)
 
-# === STEP 3: LOAD DATA ===
-img_size = 128
-batch_size = 32
+    return np.array(X), np.array(y)
 
-train_gen = ImageDataGenerator(
-    rescale=1./255,
-    rotation_range=25,
-    zoom_range=0.2,
-    horizontal_flip=True,
-    validation_split=0.1  # 10% of training used for validation
-)
+# 3. Train HMMs
+def train_hmms(X_train, y_train):
+    models = {}
+    labels = np.unique(y_train)
+    for label in tqdm(labels, desc="Training HMMs"):
+        X_label = X_train[y_train == label]
+        lengths = [len(x) for x in X_label]
+        X_concat = np.vstack(X_label)
 
-test_gen = ImageDataGenerator(rescale=1./255)
+        model = hmm.GaussianHMM(n_components=5, covariance_type="diag", n_iter=1000)
+        model.fit(X_concat.reshape(-1, 1), lengths)
+        models[label] = model
+    return models
 
-train_data = train_gen.flow_from_directory(
-    train_dir,
-    target_size=(img_size, img_size),
-    batch_size=batch_size,
-    class_mode='categorical',
-    subset='training',
-    shuffle=True
-)
+# 4. Predict
+def predict(models, X_test):
+    y_pred = []
+    for sample in tqdm(X_test, desc="Predicting"):
+        scores = {}
+        sample = sample.reshape(-1, 1)
+        for label, model in models.items():
+            try:
+                score = model.score(sample)
+                scores[label] = score
+            except:
+                scores[label] = float('-inf')
+        best_label = max(scores, key=scores.get)
+        y_pred.append(best_label)
+    return y_pred
 
-val_data = train_gen.flow_from_directory(
-    train_dir,
-    target_size=(img_size, img_size),
-    batch_size=batch_size,
-    class_mode='categorical',
-    subset='validation',
-    shuffle=True
-)
+# 5. Main script
+def main():
+    # Update path to Downloads
+    images_folder = 'C:/Users/Ethan Thompson/Downloads/V0.3/data'
 
-test_data = test_gen.flow_from_directory(
-    test_dir,
-    target_size=(img_size, img_size),
-    batch_size=batch_size,
-    class_mode='categorical',
-    shuffle=False
-)
+    X, y = load_dataset(images_folder)
 
-# === STEP 4: CNN MODEL ===
-model = Sequential([
-    Conv2D(32, (3,3), activation='relu', input_shape=(img_size, img_size, 3)),
-    BatchNormalization(),
-    MaxPooling2D(2,2),
+    if len(X) == 0:
+        print("No images loaded! Check paths.")
+        return
 
-    Conv2D(64, (3,3), activation='relu'),
-    BatchNormalization(),
-    MaxPooling2D(2,2),
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
-    Conv2D(128, (3,3), activation='relu'),
-    BatchNormalization(),
-    MaxPooling2D(2,2),
+    models = train_hmms(X_train, y_train)
 
-    Flatten(),
-    Dense(256, activation='relu'),
-    Dropout(0.5),
-    Dense(train_data.num_classes, activation='softmax')
-])
+    y_pred = predict(models, X_test)
 
-model.compile(optimizer=Adam(0.0001), loss='categorical_crossentropy', metrics=['accuracy'])
+    accuracy = np.mean(np.array(y_pred) == y_test)
+    print(f"Accuracy: {accuracy * 100:.2f}%")
 
-# === STEP 5: TRAIN ===
-checkpoint = ModelCheckpoint('best_model.h5', save_best_only=True, monitor='val_accuracy', mode='max')
-
-history = model.fit(
-    train_data,
-    validation_data=val_data,
-    epochs=20,
-    callbacks=[checkpoint]
-)
-
-# === STEP 6: PLOT ===
-plt.plot(history.history['accuracy'], label='Train Acc')
-plt.plot(history.history['val_accuracy'], label='Val Acc')
-plt.legend()
-plt.title('Accuracy over Epochs')
-plt.xlabel('Epoch')
-plt.ylabel('Accuracy')
-plt.grid(True)
-plt.show()
-
-# === STEP 7: EVALUATE ===
-loss, acc = model.evaluate(test_data)
-print(f"Test Accuracy: {acc * 100:.2f}%")
-
-# === STEP 8: CLASSIFICATION REPORT ===
-Y_pred = model.predict(test_data)
-y_pred = np.argmax(Y_pred, axis=1)
-true_labels = test_data.classes
-class_names = list(test_data.class_indices.keys())
-
-print("Confusion Matrix")
-print(confusion_matrix(true_labels, y_pred))
-print("\nClassification Report")
-print(classification_report(true_labels, y_pred, target_names=class_names))
+if __name__ == "__main__":
+    main()
